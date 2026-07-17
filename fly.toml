@@ -1,0 +1,17 @@
+# fly.toml app configuration file generated for equity-notifications on 2026-07-13T17:35:52+05:30
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'equity-notifications'
+primary_region = 'sin'
+
+[build]
+
+[processes]
+  app = "python3 price_checker.py"
+
+[[vm]]
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1

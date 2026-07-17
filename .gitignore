@@ -1,0 +1,8 @@
+.env
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+alert_state.json
+update_offset.json
+watchlist.json

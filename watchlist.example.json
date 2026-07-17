@@ -1,0 +1,16 @@
+[
+  {
+    "symbol": "RELIANCE.NS",
+    "display_name": "Reliance Industries",
+    "target_price": 3000,
+    "condition": "above",
+    "enabled": true
+  },
+  {
+    "symbol": "TCS.NS",
+    "display_name": "TCS",
+    "target_price": 3500,
+    "condition": "below",
+    "enabled": true
+  }
+]
