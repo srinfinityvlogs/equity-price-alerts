@@ -7,4 +7,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python3", "-u", "monitor.py"]
+CMD ["python3", "-u", "price_checker.py"]
