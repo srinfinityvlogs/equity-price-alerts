@@ -6,3 +6,7 @@ __pycache__/
 alert_state.json
 update_offset.json
 watchlist.json
+watchlist_*.json
+alert_state_*.json
+watchlist_*.json
+alert_state_*.json
