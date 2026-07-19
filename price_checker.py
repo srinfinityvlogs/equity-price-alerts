@@ -184,7 +184,9 @@ def handle_command(text, chat_id):
             send_telegram_message(
                 chat_id,
                 "Usage: /addstock <SYMBOL> <TARGET_PRICE> <above|below>\n"
-                "Example: /addstock RELIANCE.NS 3000 above"
+                "Example: /addstock RELIANCE.NS 3000 above\n"
+                "You can add multiple different targets for the same stock "
+                "and same condition (e.g. above 580 AND above 600)."
             )
             return
 
@@ -209,10 +211,19 @@ def handle_command(text, chat_id):
             return
 
         watchlist = load_watchlist(chat_id)
-        watchlist = [
-            s for s in watchlist
-            if not (s["symbol"] == symbol and s["condition"] == condition)
-        ]
+
+        # Only skip if the EXACT same symbol + condition + price already exists.
+        # Different price with same symbol+condition is now allowed as a
+        # separate entry (e.g. above 580 AND above 600 for the same stock).
+        exists = any(
+            s["symbol"] == symbol and s["condition"] == condition and s["target_price"] == target_price
+            for s in watchlist
+        )
+
+        if exists:
+            send_telegram_message(chat_id, f"'{symbol} {condition} ₹{target_price}' is already on your watchlist.")
+            return
+
         watchlist.append({
             "symbol": symbol,
             "display_name": symbol.replace(".NS", "").replace(".BO", ""),
@@ -224,34 +235,50 @@ def handle_command(text, chat_id):
         send_telegram_message(chat_id, f"✅ Added {symbol}: alert when price goes {condition} ₹{target_price}")
 
     elif command == "/removestock":
-        if len(parts) not in (2, 3):
+        if len(parts) not in (2, 3, 4):
             send_telegram_message(
                 chat_id,
-                "Usage: /removestock <SYMBOL> [above|below]"
+                "Usage: /removestock <SYMBOL> [above|below] [PRICE]\n"
+                "- SYMBOL only: removes ALL targets for that stock\n"
+                "- SYMBOL + above/below: removes all targets with that condition\n"
+                "- SYMBOL + above/below + PRICE: removes just that one exact target"
             )
             return
 
         symbol = parts[1].upper()
-        condition_filter = parts[2].lower() if len(parts) == 3 else None
+        condition_filter = parts[2].lower() if len(parts) >= 3 else None
+        price_filter = None
 
         if condition_filter and condition_filter not in ("above", "below"):
             send_telegram_message(chat_id, "Condition must be 'above' or 'below'.")
             return
 
+        if len(parts) == 4:
+            try:
+                price_filter = float(parts[3])
+            except ValueError:
+                send_telegram_message(chat_id, f"'{parts[3]}' is not a valid number.")
+                return
+
         watchlist = load_watchlist(chat_id)
-        if condition_filter:
-            new_watchlist = [
-                s for s in watchlist
-                if not (s["symbol"] == symbol and s["condition"] == condition_filter)
-            ]
-        else:
-            new_watchlist = [s for s in watchlist if s["symbol"] != symbol]
+
+        def should_remove(s):
+            if s["symbol"] != symbol:
+                return False
+            if condition_filter and s["condition"] != condition_filter:
+                return False
+            if price_filter is not None and s["target_price"] != price_filter:
+                return False
+            return True
+
+        new_watchlist = [s for s in watchlist if not should_remove(s)]
 
         if len(new_watchlist) == len(watchlist):
             send_telegram_message(chat_id, f"No matching entry found for '{symbol}'.")
         else:
+            removed_count = len(watchlist) - len(new_watchlist)
             save_watchlist(chat_id, new_watchlist)
-            send_telegram_message(chat_id, f"✅ Removed {symbol}")
+            send_telegram_message(chat_id, f"✅ Removed {removed_count} matching entry(ies) for {symbol}.")
 
     elif command == "/liststocks":
         watchlist = load_watchlist(chat_id)
@@ -269,8 +296,10 @@ def handle_command(text, chat_id):
             chat_id,
             "Commands:\n"
             "/addstock <SYMBOL> <PRICE> <above|below>\n"
-            "/removestock <SYMBOL> [above|below]\n"
+            "/removestock <SYMBOL> [above|below] [PRICE]\n"
             "/liststocks\n\n"
+            "A stock can have multiple targets, including several 'above' "
+            "or several 'below' at different prices.\n\n"
             "Market hours: 9:00 AM-3:30 PM IST, Mon-Fri.\n"
             "Your watchlist here is independent from any other group."
         )
