@@ -1,10 +1,10 @@
 import os
-import json
 import time
 import threading
 import requests
 import yfinance as yf
-from pathlib import Path
+import psycopg2
+from contextlib import closing
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -14,8 +14,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_CHAT_IDS = [c.strip() for c in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if c.strip()]
 
-OFFSET_FILE = Path("update_offset.json")
-
 CHECK_INTERVAL_SECONDS = 180
 COMMAND_POLL_INTERVAL_SECONDS = 5
 
@@ -24,42 +22,166 @@ MARKET_OPEN = dtime(9, 0)
 MARKET_CLOSE = dtime(15, 30)
 
 
-def watchlist_file(chat_id):
-    return Path(f"watchlist_{chat_id}.json")
+# ---------- Database setup ----------
+
+def get_conn():
+    return psycopg2.connect(
+        host=os.getenv("PGHOST"),
+        port=os.getenv("PGPORT", "5432"),
+        dbname=os.getenv("PGDATABASE"),
+        user=os.getenv("PGUSER"),
+        password=os.getenv("PGPASSWORD"),
+    )
 
 
-def alert_state_file(chat_id):
-    return Path(f"alert_state_{chat_id}.json")
+def init_db():
+    with closing(get_conn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS watchlist (
+                    chat_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    display_name TEXT,
+                    target_price DOUBLE PRECISION NOT NULL,
+                    condition TEXT NOT NULL,
+                    enabled BOOLEAN DEFAULT TRUE,
+                    PRIMARY KEY (chat_id, symbol, condition, target_price)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS alert_state (
+                    chat_id TEXT NOT NULL,
+                    alert_key TEXT NOT NULL,
+                    alerted_date TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, alert_key)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_offset (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    offset_value BIGINT NOT NULL
+                )
+            """)
+        conn.commit()
+    print("[DB] Tables ready.")
 
+
+# ---------- Watchlist (Postgres-backed) ----------
 
 def load_watchlist(chat_id):
-    f = watchlist_file(chat_id)
-    if not f.exists():
-        return []
-    with open(f, "r") as fh:
-        return json.load(fh)
+    with closing(get_conn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT symbol, display_name, target_price, condition, enabled "
+                "FROM watchlist WHERE chat_id = %s ORDER BY symbol, condition, target_price",
+                (str(chat_id),)
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "symbol": r[0],
+            "display_name": r[1],
+            "target_price": r[2],
+            "condition": r[3],
+            "enabled": r[4],
+        }
+        for r in rows
+    ]
 
 
-def save_watchlist(chat_id, watchlist):
-    with open(watchlist_file(chat_id), "w") as fh:
-        json.dump(watchlist, fh, indent=2)
+def stock_exists(chat_id, symbol, condition, target_price):
+    with closing(get_conn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM watchlist WHERE chat_id=%s AND symbol=%s AND condition=%s AND target_price=%s",
+                (str(chat_id), symbol, condition, target_price)
+            )
+            return cur.fetchone() is not None
 
 
-def load_alert_state(chat_id):
-    f = alert_state_file(chat_id)
-    if f.exists():
-        try:
-            with open(f, "r") as fh:
-                return json.load(fh)
-        except (json.JSONDecodeError, ValueError):
-            return {}
-    return {}
+def add_stock(chat_id, symbol, display_name, target_price, condition):
+    with closing(get_conn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO watchlist (chat_id, symbol, display_name, target_price, condition, enabled)
+                VALUES (%s, %s, %s, %s, %s, TRUE)
+                ON CONFLICT (chat_id, symbol, condition, target_price) DO NOTHING
+                """,
+                (str(chat_id), symbol, display_name, target_price, condition)
+            )
+        conn.commit()
 
 
-def save_alert_state(chat_id, state):
-    with open(alert_state_file(chat_id), "w") as fh:
-        json.dump(state, fh)
+def remove_stock(chat_id, symbol, condition_filter=None, price_filter=None):
+    query = "DELETE FROM watchlist WHERE chat_id=%s AND symbol=%s"
+    params = [str(chat_id), symbol]
 
+    if condition_filter:
+        query += " AND condition=%s"
+        params.append(condition_filter)
+    if price_filter is not None:
+        query += " AND target_price=%s"
+        params.append(price_filter)
+
+    with closing(get_conn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, tuple(params))
+            removed_count = cur.rowcount
+        conn.commit()
+    return removed_count
+
+
+# ---------- Alert state (Postgres-backed) ----------
+
+def is_already_alerted(chat_id, alert_key, today):
+    with closing(get_conn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM alert_state WHERE chat_id=%s AND alert_key=%s AND alerted_date=%s",
+                (str(chat_id), alert_key, today)
+            )
+            return cur.fetchone() is not None
+
+
+def mark_alerted(chat_id, alert_key, today):
+    with closing(get_conn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO alert_state (chat_id, alert_key, alerted_date)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (chat_id, alert_key) DO UPDATE SET alerted_date = EXCLUDED.alerted_date
+                """,
+                (str(chat_id), alert_key, today)
+            )
+        conn.commit()
+
+
+# ---------- Offset (Postgres-backed) ----------
+
+def load_offset():
+    with closing(get_conn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT offset_value FROM bot_offset WHERE id = 1")
+            row = cur.fetchone()
+    return row[0] if row else 0
+
+
+def save_offset(offset):
+    with closing(get_conn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bot_offset (id, offset_value) VALUES (1, %s)
+                ON CONFLICT (id) DO UPDATE SET offset_value = EXCLUDED.offset_value
+                """,
+                (offset,)
+            )
+        conn.commit()
+
+
+# ---------- Market hours & price fetching ----------
 
 def is_market_open():
     now = datetime.now(IST)
@@ -92,7 +214,6 @@ def send_telegram_message(chat_id, message):
 
 def check_watchlist_for_chat(chat_id):
     watchlist = load_watchlist(chat_id)
-    alert_state = load_alert_state(chat_id)
     today = get_today_key()
 
     for stock in watchlist:
@@ -102,15 +223,15 @@ def check_watchlist_for_chat(chat_id):
         symbol = stock["symbol"]
         target = stock["target_price"]
         condition = stock["condition"]
-        display_name = stock.get("display_name", symbol)
+        display_name = stock.get("display_name") or symbol
 
         price = fetch_price(symbol)
         if price is None:
             print(f"[WARN] chat={chat_id}: No price data for {symbol}")
             continue
 
-        alert_key = f"{symbol}:{condition}:{target}:{today}"
-        already_alerted = alert_state.get(alert_key, False)
+        alert_key = f"{symbol}:{condition}:{target}"
+        already_alerted = is_already_alerted(chat_id, alert_key, today)
 
         triggered = (
             (condition == "above" and price > target) or
@@ -127,25 +248,11 @@ def check_watchlist_for_chat(chat_id):
                 f"Has {direction} your target of ₹{target}"
             )
             send_telegram_message(chat_id, message)
-            alert_state[alert_key] = True
-            save_alert_state(chat_id, alert_state)
+            mark_alerted(chat_id, alert_key, today)
             print(f"[ALERTED] chat={chat_id} {symbol} ({condition} {target})")
 
 
-def load_offset():
-    if OFFSET_FILE.exists():
-        try:
-            with open(OFFSET_FILE, "r") as f:
-                return json.load(f).get("offset", 0)
-        except (json.JSONDecodeError, ValueError):
-            return 0
-    return 0
-
-
-def save_offset(offset):
-    with open(OFFSET_FILE, "w") as f:
-        json.dump({"offset": offset}, f)
-
+# ---------- Chat command handling ----------
 
 def get_updates(offset):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
@@ -210,28 +317,12 @@ def handle_command(text, chat_id):
             )
             return
 
-        watchlist = load_watchlist(chat_id)
-
-        # Only skip if the EXACT same symbol + condition + price already exists.
-        # Different price with same symbol+condition is now allowed as a
-        # separate entry (e.g. above 580 AND above 600 for the same stock).
-        exists = any(
-            s["symbol"] == symbol and s["condition"] == condition and s["target_price"] == target_price
-            for s in watchlist
-        )
-
-        if exists:
+        if stock_exists(chat_id, symbol, condition, target_price):
             send_telegram_message(chat_id, f"'{symbol} {condition} ₹{target_price}' is already on your watchlist.")
             return
 
-        watchlist.append({
-            "symbol": symbol,
-            "display_name": symbol.replace(".NS", "").replace(".BO", ""),
-            "target_price": target_price,
-            "condition": condition,
-            "enabled": True
-        })
-        save_watchlist(chat_id, watchlist)
+        display_name = symbol.replace(".NS", "").replace(".BO", "")
+        add_stock(chat_id, symbol, display_name, target_price, condition)
         send_telegram_message(chat_id, f"✅ Added {symbol}: alert when price goes {condition} ₹{target_price}")
 
     elif command == "/removestock":
@@ -260,24 +351,11 @@ def handle_command(text, chat_id):
                 send_telegram_message(chat_id, f"'{parts[3]}' is not a valid number.")
                 return
 
-        watchlist = load_watchlist(chat_id)
+        removed_count = remove_stock(chat_id, symbol, condition_filter, price_filter)
 
-        def should_remove(s):
-            if s["symbol"] != symbol:
-                return False
-            if condition_filter and s["condition"] != condition_filter:
-                return False
-            if price_filter is not None and s["target_price"] != price_filter:
-                return False
-            return True
-
-        new_watchlist = [s for s in watchlist if not should_remove(s)]
-
-        if len(new_watchlist) == len(watchlist):
+        if removed_count == 0:
             send_telegram_message(chat_id, f"No matching entry found for '{symbol}'.")
         else:
-            removed_count = len(watchlist) - len(new_watchlist)
-            save_watchlist(chat_id, new_watchlist)
             send_telegram_message(chat_id, f"✅ Removed {removed_count} matching entry(ies) for {symbol}.")
 
     elif command == "/liststocks":
@@ -321,6 +399,8 @@ def poll_commands_loop():
         time.sleep(COMMAND_POLL_INTERVAL_SECONDS)
 
 
+# ---------- Price checking loop ----------
+
 def price_check_loop():
     print("Starting price checker...")
     while True:
@@ -337,10 +417,20 @@ def price_check_loop():
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 
+# ---------- Run both loops concurrently ----------
+
 def main():
     if not ALLOWED_CHAT_IDS:
         print("[FATAL] No ALLOWED_CHAT_IDS configured. Set it in .env, comma-separated.")
         return
+
+    required = ["PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD"]
+    missing = [v for v in required if not os.getenv(v)]
+    if missing:
+        print(f"[FATAL] Missing database env vars: {missing}")
+        return
+
+    init_db()
 
     print(f"Configured for {len(ALLOWED_CHAT_IDS)} chat(s): {ALLOWED_CHAT_IDS}")
 
