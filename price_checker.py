@@ -6,7 +6,7 @@ import requests
 import yfinance as yf
 import psycopg2
 from contextlib import closing
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
@@ -161,7 +161,7 @@ def mark_alerted(chat_id, alert_key, today):
         conn.commit()
 
 
-# ---------- Reminders (Postgres-backed, ONE-TIME, today only) ----------
+# ---------- Reminders (Postgres-backed, one-time, any date) ----------
 
 def add_reminder(chat_id, remind_time, target_date, message):
     with closing(get_conn()) as conn:
@@ -189,13 +189,21 @@ def remove_reminder(chat_id, remind_time, target_date):
     return removed
 
 
-def load_reminders(chat_id, target_date):
+def load_reminders(chat_id, target_date=None):
     with closing(get_conn()) as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT remind_time, message FROM reminders WHERE chat_id=%s AND target_date=%s ORDER BY remind_time",
-                (str(chat_id), target_date)
-            )
+            if target_date:
+                cur.execute(
+                    "SELECT remind_time, target_date, message FROM reminders "
+                    "WHERE chat_id=%s AND target_date=%s ORDER BY remind_time",
+                    (str(chat_id), target_date)
+                )
+            else:
+                cur.execute(
+                    "SELECT remind_time, target_date, message FROM reminders "
+                    "WHERE chat_id=%s ORDER BY target_date, remind_time",
+                    (str(chat_id),)
+                )
             return cur.fetchall()
 
 
@@ -220,6 +228,7 @@ def delete_reminder_exact(chat_id, remind_time, target_date):
 
 
 TIME_RE = re.compile(r'^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?$', re.IGNORECASE)
+DATE_RE = re.compile(r'^(\d{1,2})-(\d{1,2})-(\d{4})$')
 
 
 def parse_time_to_24h(time_str):
@@ -240,6 +249,34 @@ def parse_time_to_24h(time_str):
         return None
 
     return f"{hour:02d}:{minute:02d}"
+
+
+def parse_date_token(token, now_ist):
+    """Parses 'today', 'tomorrow', or 'DD-MM-YYYY' into 'YYYY-MM-DD', or None if not a date at all."""
+    t = token.strip().lower()
+    if t == "today":
+        return now_ist.strftime("%Y-%m-%d")
+    if t == "tomorrow":
+        return (now_ist + timedelta(days=1)).strftime("%Y-%m-%d")
+    m = DATE_RE.match(token.strip())
+    if m:
+        day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            d = datetime(year, month, day)
+            return d.strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+    return None
+
+
+def format_date_for_display(date_str, now_ist):
+    today_str = now_ist.strftime("%Y-%m-%d")
+    tomorrow_str = (now_ist + timedelta(days=1)).strftime("%Y-%m-%d")
+    if date_str == today_str:
+        return "today"
+    if date_str == tomorrow_str:
+        return "tomorrow"
+    return date_str
 
 
 # ---------- Offset (Postgres-backed) ----------
@@ -368,7 +405,8 @@ def handle_command(text, chat_id):
 
     command = parts[0].lower()
     rest = parts[1:]
-    today = get_today_key()
+    now_ist = datetime.now(IST)
+    today = now_ist.strftime("%Y-%m-%d")
 
     if command == "/addstock":
         if len(parts) != 4:
@@ -385,7 +423,7 @@ def handle_command(text, chat_id):
             return
         send_telegram_message(chat_id, f"Checking if {symbol} is a valid symbol...")
         if not is_valid_symbol(symbol):
-            send_telegram_message(chat_id, f"Couldn't find price data for '{symbol}'. Make sure it's a valid ticker (NSE needs '.NS').")
+            send_telegram_message(chat_id, f"Couldn't find price data for '{symbol}'. NSE needs '.NS' (e.g. RELIANCE.NS), BSE needs '.BO' with the ticker symbol, not the numeric scrip code.")
             return
         if stock_exists(chat_id, symbol, condition, target_price):
             send_telegram_message(chat_id, f"'{symbol} {condition} ₹{target_price}' is already on your watchlist.")
@@ -431,47 +469,90 @@ def handle_command(text, chat_id):
         if not rest:
             send_telegram_message(
                 chat_id,
-                "Usage: /remindme <TIME> [message]\n"
-                "Time formats: 2PM, 2:30PM, 14:00, 09:15 (no space before AM/PM)\n"
-                "Example: /remindme 2PM Check the market\n"
-                "This is a ONE-TIME reminder for today only."
+                "Usage: /remindme [DATE] <TIME> [message]\n"
+                "DATE (optional): today, tomorrow, or DD-MM-YYYY (defaults to today)\n"
+                "TIME: 2PM, 2:30PM, 14:00, 09:15 (no space before AM/PM)\n"
+                "Examples:\n"
+                "/remindme 2PM\n"
+                "/remindme tomorrow 10AM Check IPO listing\n"
+                "/remindme 25-07-2026 9:15AM Market opens"
             )
             return
-        time_str = rest[0]
-        message_text = " ".join(rest[1:]) if len(rest) > 1 else "⏰ Reminder: check the market!"
+
+        maybe_date = parse_date_token(rest[0], now_ist)
+        if maybe_date is not None:
+            target_date = maybe_date
+            if len(rest) < 2:
+                send_telegram_message(chat_id, "Missing time. Usage: /remindme [DATE] <TIME> [message]")
+                return
+            time_str = rest[1]
+            message_tokens = rest[2:]
+        else:
+            target_date = today
+            time_str = rest[0]
+            message_tokens = rest[1:]
+
+        message_text = " ".join(message_tokens) if message_tokens else "⏰ Reminder: check the market!"
         parsed_time = parse_time_to_24h(time_str)
         if parsed_time is None:
             send_telegram_message(chat_id, f"Couldn't understand time '{time_str}'. Try formats like 2PM, 2:30PM, or 14:00.")
             return
-        current_hm = datetime.now(IST).strftime("%H:%M")
-        if parsed_time <= current_hm:
-            send_telegram_message(chat_id, f"'{parsed_time}' has already passed today ({current_hm} now). Reminder not set.")
+
+        current_hm = now_ist.strftime("%H:%M")
+        if target_date == today and parsed_time <= current_hm:
+            send_telegram_message(chat_id, f"'{parsed_time}' has already passed today ({current_hm} now). Choose a later time, or a future date.")
             return
-        add_reminder(chat_id, parsed_time, today, message_text)
-        send_telegram_message(chat_id, f"✅ One-time reminder set for {parsed_time} IST TODAY: \"{message_text}\"")
+        if target_date < today:
+            send_telegram_message(chat_id, f"'{target_date}' is in the past. Choose today or a future date.")
+            return
+
+        add_reminder(chat_id, parsed_time, target_date, message_text)
+        display_date = format_date_for_display(target_date, now_ist)
+        send_telegram_message(chat_id, f"✅ One-time reminder set for {parsed_time} IST on {display_date}: \"{message_text}\"")
 
     elif command == "/removereminder":
         if not rest:
-            send_telegram_message(chat_id, "Usage: /removereminder <TIME>\nExample: /removereminder 2PM")
+            send_telegram_message(chat_id, "Usage: /removereminder [DATE] <TIME>\nExample: /removereminder tomorrow 2PM")
             return
-        parsed_time = parse_time_to_24h(rest[0])
-        if parsed_time is None:
-            send_telegram_message(chat_id, f"Couldn't understand time '{rest[0]}'.")
-            return
-        removed = remove_reminder(chat_id, parsed_time, today)
-        if removed:
-            send_telegram_message(chat_id, f"✅ Removed today's reminder at {parsed_time}.")
+
+        maybe_date = parse_date_token(rest[0], now_ist)
+        if maybe_date is not None:
+            target_date = maybe_date
+            if len(rest) < 2:
+                send_telegram_message(chat_id, "Missing time. Usage: /removereminder [DATE] <TIME>")
+                return
+            time_str = rest[1]
         else:
-            send_telegram_message(chat_id, f"No reminder found at {parsed_time} for today.")
+            target_date = today
+            time_str = rest[0]
+
+        parsed_time = parse_time_to_24h(time_str)
+        if parsed_time is None:
+            send_telegram_message(chat_id, f"Couldn't understand time '{time_str}'.")
+            return
+
+        removed = remove_reminder(chat_id, parsed_time, target_date)
+        display_date = format_date_for_display(target_date, now_ist)
+        if removed:
+            send_telegram_message(chat_id, f"✅ Removed reminder at {parsed_time} on {display_date}.")
+        else:
+            send_telegram_message(chat_id, f"No reminder found at {parsed_time} on {display_date}.")
 
     elif command == "/listreminders":
-        reminders = load_reminders(chat_id, today)
+        target_date = None
+        if rest:
+            maybe_date = parse_date_token(rest[0], now_ist)
+            if maybe_date is not None:
+                target_date = maybe_date
+
+        reminders = load_reminders(chat_id, target_date)
         if not reminders:
-            send_telegram_message(chat_id, "No reminders set for today.")
+            send_telegram_message(chat_id, "No reminders set.")
             return
-        lines = ["⏰ Today's reminders:"]
-        for remind_time, message in reminders:
-            lines.append(f"- {remind_time}: {message}")
+        lines = ["⏰ Your reminders:"]
+        for remind_time, r_date, message in reminders:
+            display_date = format_date_for_display(r_date, now_ist)
+            lines.append(f"- {display_date} {remind_time}: {message}")
         send_telegram_message(chat_id, "\n".join(lines))
 
     elif command == "/help":
@@ -485,10 +566,13 @@ def handle_command(text, chat_id):
             "NSE: TICKER.NS (e.g. RELIANCE.NS)\n"
             "BSE: TICKER.BO (e.g. AFCOM.BO) - use the trading symbol, "
             "NOT the numeric BSE scrip code from screener.in/BSE India\n\n"
-            "Reminder commands (one-time, today only):\n"
-            "/remindme <TIME> [message] - e.g. /remindme 2PM Check market\n"
-            "/removereminder <TIME>\n"
-            "/listreminders\n\n"
+            "Reminder commands (one-time):\n"
+            "/remindme [DATE] <TIME> [message] - DATE optional (today/tomorrow/DD-MM-YYYY), defaults to today\n"
+            "  e.g. /remindme 2PM Check market\n"
+            "  e.g. /remindme tomorrow 10AM Check IPO listing\n"
+            "  e.g. /remindme 25-07-2026 9:15AM Market opens\n"
+            "/removereminder [DATE] <TIME>\n"
+            "/listreminders [DATE] - omit DATE to see all upcoming reminders\n\n"
             "Market hours: 9:00 AM-3:30 PM IST, Mon-Fri.\n"
             "Your data here is independent from any other group."
         )
@@ -528,7 +612,7 @@ def price_check_loop():
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 
-# ---------- Reminder loop (one-time, fires then deletes) ----------
+# ---------- Reminder loop (one-time, any date, fires then deletes) ----------
 
 def reminder_loop():
     print("Starting reminder checker...")
@@ -536,11 +620,11 @@ def reminder_loop():
         try:
             now = datetime.now(IST)
             current_hm = now.strftime("%H:%M")
-            today = get_today_key()
+            today = now.strftime("%Y-%m-%d")
             for chat_id, remind_time, message in load_due_reminders(today, current_hm):
                 send_telegram_message(chat_id, message)
                 delete_reminder_exact(chat_id, remind_time, today)
-                print(f"[REMINDER SENT] chat={chat_id} at {remind_time}")
+                print(f"[REMINDER SENT] chat={chat_id} at {remind_time} on {today}")
         except Exception as e:
             print(f"[REMINDER ERROR] {e}")
         time.sleep(REMINDER_CHECK_INTERVAL_SECONDS)
