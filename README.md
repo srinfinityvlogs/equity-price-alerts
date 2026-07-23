@@ -85,7 +85,7 @@ You should see `[DB] Tables ready.` on startup — this confirms it connected an
 
 ### 7. Deploy (so it runs 24/7 without your computer)
 This repo includes a `Dockerfile`, so it deploys to any Docker-friendly host. A few options:
-- **Northflank** (Sandbox tier — free service compute, always-on, no sleep) — connect this GitHub repo, build type: Dockerfile, no exposed ports needed, add the six environment variables above as runtime variables, and add a Postgres addon in the same project
+- **Northflank** (Sandbox tier — free service compute, always-on, no sleep) — connect this GitHub repo, build type: Dockerfile, no exposed ports needed, add the environment variables above as runtime variables, and add a Postgres addon in the same project
 - **Fly.io** — no longer has a free tier, but cheap (~$2-5/month) for a small always-on machine, plus their own Postgres offering
 - **Your own VPS / home server / Raspberry Pi** — run via Docker or directly with the venv steps above, paired with any Postgres instance
 
@@ -96,16 +96,24 @@ This repo includes a `Dockerfile`, so it deploys to any Docker-friendly host. A 
 Since watchlists are keyed by chat ID in the database, adding a new group doesn't require any code changes:
 1. Get the new group's chat ID (same process as Setup step 2)
 2. Add it to `ALLOWED_CHAT_IDS` in your environment variables (comma-separated)
-3. Redeploy
+3. Redeploy/restart
 
 The new group starts with an empty watchlist and no reminders — fully independent of every other group already using the bot.
+
+---
+
+## Symbol format (important)
+
+- **NSE:** `TICKER.NS` — e.g. `RELIANCE.NS`, `TCS.NS`
+- **BSE:** `TICKER.BO` — e.g. `AFCOM.BO`
+
+For BSE stocks, always use the **trading ticker symbol**, not the numeric BSE scrip code shown on screener.in or BSE India (e.g. use `AFCOM`, not `544224`). The bot validates symbols via Yahoo Finance before adding them, so an invalid or unsupported ticker will be rejected immediately rather than silently failing later. Not every thinly-traded BSE stock is covered by Yahoo Finance — if a correctly formatted ticker still fails, Yahoo may simply not carry data for it.
 
 ---
 
 ## Notes
 
 - **Data source:** prices come from Yahoo Finance (`yfinance`), a free but unofficial feed — not tied to any broker account.
-- **NSE tickers** need `.NS`, **BSE tickers** need `.BO`.
 - **Market hours are hardcoded to IST** (`Asia/Kolkata`) regardless of server timezone.
 - The bot only responds to commands from chat IDs listed in `ALLOWED_CHAT_IDS` — everyone else is ignored.
 - **Within a group, commands are shared** — there's no per-person separation inside a single group. If two people are in the same group, they share that group's one watchlist. For separate watchlists, use separate groups.
