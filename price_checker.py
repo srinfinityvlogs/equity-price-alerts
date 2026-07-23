@@ -14,6 +14,8 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_CHAT_IDS = [c.strip() for c in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if c.strip()]
+BROADCAST_CHAT_IDS = [c.strip() for c in os.getenv("BROADCAST_CHAT_IDS", "").split(",") if c.strip()]
+ADMIN_TELEGRAM_USER_ID = os.getenv("ADMIN_TELEGRAM_USER_ID", "").strip()
 
 CHECK_INTERVAL_SECONDS = 180
 COMMAND_POLL_INTERVAL_SECONDS = 5
@@ -232,27 +234,22 @@ DATE_RE = re.compile(r'^(\d{1,2})-(\d{1,2})-(\d{4})$')
 
 
 def parse_time_to_24h(time_str):
-    """Parses '2PM', '2:30PM', '14:00', '09:15' into 'HH:MM' 24-hour format, or None if invalid."""
     m = TIME_RE.match(time_str.strip())
     if not m:
         return None
     hour = int(m.group(1))
     minute = int(m.group(2)) if m.group(2) else 0
     ampm = m.group(3).upper() if m.group(3) else None
-
     if ampm == "PM" and hour != 12:
         hour += 12
     elif ampm == "AM" and hour == 12:
         hour = 0
-
     if not (0 <= hour <= 23) or not (0 <= minute <= 59):
         return None
-
     return f"{hour:02d}:{minute:02d}"
 
 
 def parse_date_token(token, now_ist):
-    """Parses 'today', 'tomorrow', or 'DD-MM-YYYY' into 'YYYY-MM-DD', or None if not a date at all."""
     t = token.strip().lower()
     if t == "today":
         return now_ist.strftime("%Y-%m-%d")
@@ -336,7 +333,6 @@ def send_telegram_message(chat_id, message):
 def check_watchlist_for_chat(chat_id):
     watchlist = load_watchlist(chat_id)
     today = get_today_key()
-
     for stock in watchlist:
         if not stock.get("enabled", True):
             continue
@@ -344,21 +340,17 @@ def check_watchlist_for_chat(chat_id):
         target = stock["target_price"]
         condition = stock["condition"]
         display_name = stock.get("display_name") or symbol
-
         price = fetch_price(symbol)
         if price is None:
             print(f"[WARN] chat={chat_id}: No price data for {symbol}")
             continue
-
         alert_key = f"{symbol}:{condition}:{target}"
         already_alerted = is_already_alerted(chat_id, alert_key, today)
         triggered = (
             (condition == "above" and price > target) or
             (condition == "below" and price < target)
         )
-
         print(f"chat={chat_id} {symbol}: Rs.{price:.2f} (target {condition} Rs.{target}) - triggered={triggered}, already_alerted={already_alerted}")
-
         if triggered and not already_alerted:
             direction = "risen above" if condition == "above" else "fallen below"
             message = (
@@ -393,7 +385,7 @@ def is_valid_symbol(symbol):
         return False
 
 
-def handle_command(text, chat_id):
+def handle_command(text, chat_id, from_user_id):
     chat_id_str = str(chat_id)
     if chat_id_str not in ALLOWED_CHAT_IDS:
         print(f"[IGNORED] Command from unauthorized chat_id={chat_id}")
@@ -423,7 +415,7 @@ def handle_command(text, chat_id):
             return
         send_telegram_message(chat_id, f"Checking if {symbol} is a valid symbol...")
         if not is_valid_symbol(symbol):
-            send_telegram_message(chat_id, f"Couldn't find price data for '{symbol}'. NSE needs '.NS' (e.g. RELIANCE.NS), BSE needs '.BO' with the ticker symbol, not the numeric scrip code.")
+            send_telegram_message(chat_id, f"Couldn't find price data for '{symbol}'. NSE needs '.NS', BSE needs '.BO' with the ticker symbol, not the numeric scrip code.")
             return
         if stock_exists(chat_id, symbol, condition, target_price):
             send_telegram_message(chat_id, f"'{symbol} {condition} ₹{target_price}' is already on your watchlist.")
@@ -471,14 +463,10 @@ def handle_command(text, chat_id):
                 chat_id,
                 "Usage: /remindme [DATE] <TIME> [message]\n"
                 "DATE (optional): today, tomorrow, or DD-MM-YYYY (defaults to today)\n"
-                "TIME: 2PM, 2:30PM, 14:00, 09:15 (no space before AM/PM)\n"
-                "Examples:\n"
-                "/remindme 2PM\n"
-                "/remindme tomorrow 10AM Check IPO listing\n"
-                "/remindme 25-07-2026 9:15AM Market opens"
+                "TIME: 2PM, 2:30PM, 14:00, 09:15\n"
+                "Example: /remindme tomorrow 10AM Check IPO listing"
             )
             return
-
         maybe_date = parse_date_token(rest[0], now_ist)
         if maybe_date is not None:
             target_date = maybe_date
@@ -491,13 +479,11 @@ def handle_command(text, chat_id):
             target_date = today
             time_str = rest[0]
             message_tokens = rest[1:]
-
         message_text = " ".join(message_tokens) if message_tokens else "⏰ Reminder: check the market!"
         parsed_time = parse_time_to_24h(time_str)
         if parsed_time is None:
             send_telegram_message(chat_id, f"Couldn't understand time '{time_str}'. Try formats like 2PM, 2:30PM, or 14:00.")
             return
-
         current_hm = now_ist.strftime("%H:%M")
         if target_date == today and parsed_time <= current_hm:
             send_telegram_message(chat_id, f"'{parsed_time}' has already passed today ({current_hm} now). Choose a later time, or a future date.")
@@ -505,16 +491,14 @@ def handle_command(text, chat_id):
         if target_date < today:
             send_telegram_message(chat_id, f"'{target_date}' is in the past. Choose today or a future date.")
             return
-
         add_reminder(chat_id, parsed_time, target_date, message_text)
         display_date = format_date_for_display(target_date, now_ist)
         send_telegram_message(chat_id, f"✅ One-time reminder set for {parsed_time} IST on {display_date}: \"{message_text}\"")
 
     elif command == "/removereminder":
         if not rest:
-            send_telegram_message(chat_id, "Usage: /removereminder [DATE] <TIME>\nExample: /removereminder tomorrow 2PM")
+            send_telegram_message(chat_id, "Usage: /removereminder [DATE] <TIME>")
             return
-
         maybe_date = parse_date_token(rest[0], now_ist)
         if maybe_date is not None:
             target_date = maybe_date
@@ -525,12 +509,10 @@ def handle_command(text, chat_id):
         else:
             target_date = today
             time_str = rest[0]
-
         parsed_time = parse_time_to_24h(time_str)
         if parsed_time is None:
             send_telegram_message(chat_id, f"Couldn't understand time '{time_str}'.")
             return
-
         removed = remove_reminder(chat_id, parsed_time, target_date)
         display_date = format_date_for_display(target_date, now_ist)
         if removed:
@@ -544,7 +526,6 @@ def handle_command(text, chat_id):
             maybe_date = parse_date_token(rest[0], now_ist)
             if maybe_date is not None:
                 target_date = maybe_date
-
         reminders = load_reminders(chat_id, target_date)
         if not reminders:
             send_telegram_message(chat_id, "No reminders set.")
@@ -554,6 +535,32 @@ def handle_command(text, chat_id):
             display_date = format_date_for_display(r_date, now_ist)
             lines.append(f"- {display_date} {remind_time}: {message}")
         send_telegram_message(chat_id, "\n".join(lines))
+
+    elif command == "/broadcast":
+        # Admin-only, regardless of which allowed group it's sent from.
+        if not ADMIN_TELEGRAM_USER_ID or str(from_user_id) != ADMIN_TELEGRAM_USER_ID:
+            send_telegram_message(chat_id, "You're not authorized to use this command.")
+            print(f"[BROADCAST DENIED] user_id={from_user_id} tried /broadcast")
+            return
+        if not rest:
+            send_telegram_message(chat_id, "Usage: /broadcast <message>")
+            return
+        if not BROADCAST_CHAT_IDS:
+            send_telegram_message(chat_id, "No BROADCAST_CHAT_IDS configured.")
+            return
+        broadcast_text = " ".join(rest)
+        sent, failed = 0, []
+        for target_chat_id in BROADCAST_CHAT_IDS:
+            try:
+                send_telegram_message(target_chat_id, broadcast_text)
+                sent += 1
+            except Exception as e:
+                failed.append(target_chat_id)
+        summary = f"✅ Broadcast sent to {sent} group(s)."
+        if failed:
+            summary += f" Failed: {failed}"
+        send_telegram_message(chat_id, summary)
+        print(f"[BROADCAST] Sent to {BROADCAST_CHAT_IDS} by user_id={from_user_id}")
 
     elif command == "/help":
         send_telegram_message(
@@ -565,17 +572,15 @@ def handle_command(text, chat_id):
             "Symbol format:\n"
             "NSE: TICKER.NS (e.g. RELIANCE.NS)\n"
             "BSE: TICKER.BO (e.g. AFCOM.BO) - use the trading symbol, "
-            "NOT the numeric BSE scrip code from screener.in/BSE India\n\n"
+            "NOT the numeric BSE scrip code\n\n"
             "Reminder commands (one-time):\n"
-            "/remindme [DATE] <TIME> [message] - DATE optional (today/tomorrow/DD-MM-YYYY), defaults to today\n"
-            "  e.g. /remindme 2PM Check market\n"
-            "  e.g. /remindme tomorrow 10AM Check IPO listing\n"
-            "  e.g. /remindme 25-07-2026 9:15AM Market opens\n"
+            "/remindme [DATE] <TIME> [message] - DATE optional (today/tomorrow/DD-MM-YYYY)\n"
             "/removereminder [DATE] <TIME>\n"
-            "/listreminders [DATE] - omit DATE to see all upcoming reminders\n\n"
+            "/listreminders [DATE]\n\n"
             "Market hours: 9:00 AM-3:30 PM IST, Mon-Fri.\n"
             "Your data here is independent from any other group."
         )
+        # Note: /broadcast intentionally NOT listed here - admin-only, undocumented in public help.
 
 
 def poll_commands_loop():
@@ -589,8 +594,9 @@ def poll_commands_loop():
             message = update.get("message", {})
             text = message.get("text", "")
             chat_id = message.get("chat", {}).get("id")
+            from_user_id = message.get("from", {}).get("id")
             if text.startswith("/"):
-                handle_command(text, chat_id)
+                handle_command(text, chat_id, from_user_id)
         time.sleep(COMMAND_POLL_INTERVAL_SECONDS)
 
 
@@ -612,7 +618,7 @@ def price_check_loop():
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 
-# ---------- Reminder loop (one-time, any date, fires then deletes) ----------
+# ---------- Reminder loop ----------
 
 def reminder_loop():
     print("Starting reminder checker...")
@@ -646,6 +652,8 @@ def main():
     init_db()
 
     print(f"Configured for {len(ALLOWED_CHAT_IDS)} chat(s): {ALLOWED_CHAT_IDS}")
+    print(f"Broadcast targets: {BROADCAST_CHAT_IDS}")
+    print(f"Admin user configured: {'yes' if ADMIN_TELEGRAM_USER_ID else 'NO - /broadcast disabled'}")
 
     threading.Thread(target=price_check_loop, daemon=True).start()
     threading.Thread(target=poll_commands_loop, daemon=True).start()
