@@ -16,7 +16,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_CHAT_IDS = [c.strip() for c in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if c.strip()]
 BROADCAST_CHAT_IDS = [c.strip() for c in os.getenv("BROADCAST_CHAT_IDS", "").split(",") if c.strip()]
 ADMIN_TELEGRAM_USER_ID = os.getenv("ADMIN_TELEGRAM_USER_ID", "").strip()
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()  # where relayed replies land (your own group)
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
 GROUP_LABELS = {}
 for pair in os.getenv("GROUP_LABELS", "").split(","):
@@ -74,8 +74,41 @@ def init_db():
                     PRIMARY KEY (chat_id, remind_time, target_date)
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sent_messages (
+                    chat_id TEXT NOT NULL,
+                    message_id BIGINT NOT NULL,
+                    content TEXT,
+                    sent_at TIMESTAMP DEFAULT NOW(),
+                    PRIMARY KEY (chat_id, message_id)
+                )
+            """)
         conn.commit()
     print("[DB] Tables ready.")
+
+
+def log_sent_message(chat_id, message_id, content):
+    if message_id is None:
+        return
+    with closing(get_conn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO sent_messages (chat_id, message_id, content) VALUES (%s, %s, %s)
+                ON CONFLICT (chat_id, message_id) DO NOTHING""",
+                (str(chat_id), message_id, content[:500] if content else None)
+            )
+        conn.commit()
+
+
+def get_sent_message_content(chat_id, message_id):
+    with closing(get_conn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT content FROM sent_messages WHERE chat_id=%s AND message_id=%s",
+                (str(chat_id), message_id)
+            )
+            row = cur.fetchone()
+    return row[0] if row else None
 
 
 def load_watchlist(chat_id):
@@ -307,13 +340,18 @@ def fetch_price(symbol):
     return float(data["Close"].iloc[-1])
 
 
-def send_telegram_message(chat_id, message):
+def send_telegram_message(chat_id, message, log_content=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
         resp = requests.post(url, data={"chat_id": chat_id, "text": message}, timeout=10)
         resp.raise_for_status()
+        result = resp.json().get("result", {})
+        message_id = result.get("message_id")
+        log_sent_message(chat_id, message_id, log_content if log_content is not None else message)
+        return message_id
     except requests.RequestException as e:
         print(f"[SEND ERROR] chat={chat_id}: {e}")
+        return None
 
 
 def send_telegram_photo(chat_id, file_id, caption=None):
@@ -324,8 +362,13 @@ def send_telegram_photo(chat_id, file_id, caption=None):
     try:
         resp = requests.post(url, data=data, timeout=15)
         resp.raise_for_status()
+        result = resp.json().get("result", {})
+        message_id = result.get("message_id")
+        log_sent_message(chat_id, message_id, caption or "[image]")
+        return message_id
     except requests.RequestException as e:
         print(f"[PHOTO SEND ERROR] chat={chat_id}: {e}")
+        return None
 
 
 def check_watchlist_for_chat(chat_id):
@@ -356,7 +399,11 @@ def check_watchlist_for_chat(chat_id):
 
 def get_updates(offset):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    params = {"offset": offset, "timeout": 10}
+    params = {
+        "offset": offset,
+        "timeout": 10,
+        "allowed_updates": '["message","message_reaction"]',
+    }
     try:
         resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
@@ -379,17 +426,43 @@ def is_admin(from_user_id):
 
 
 def relay_reply_to_admin(chat_id, message):
-    if not ADMIN_CHAT_ID:
+    if not ADMIN_CHAT_ID or str(chat_id) == ADMIN_CHAT_ID:
         return
-    if str(chat_id) == ADMIN_CHAT_ID:
-        return  # don't relay replies happening in your own group back to yourself
     sender = message.get("from", {})
     sender_name = sender.get("first_name", "") or sender.get("username", "") or "Someone"
     reply_text = message.get("text") or message.get("caption") or "(non-text message)"
     label = label_for_chat_id(chat_id)
-    relayed = f"💬 Reply from {label} ({sender_name}):\n{reply_text}"
-    send_telegram_message(ADMIN_CHAT_ID, relayed)
+
+    original_message_id = message.get("reply_to_message", {}).get("message_id")
+    original_content = get_sent_message_content(chat_id, original_message_id) if original_message_id else None
+
+    lines = [f"💬 Reply from {label} ({sender_name}):"]
+    if original_content:
+        preview = original_content if len(original_content) <= 100 else original_content[:100] + "..."
+        lines.append(f"(re: \"{preview}\")")
+    lines.append(reply_text)
+
+    send_telegram_message(ADMIN_CHAT_ID, "\n".join(lines))
     print(f"[REPLY RELAYED] from chat={chat_id} label={label} sender={sender_name}")
+
+
+def relay_reaction_to_admin(chat_id, message_id, user, reaction_emojis):
+    if not ADMIN_CHAT_ID or str(chat_id) == ADMIN_CHAT_ID:
+        return
+    sender_name = user.get("first_name", "") or user.get("username", "") or "Someone"
+    label = label_for_chat_id(chat_id)
+    original_content = get_sent_message_content(chat_id, message_id)
+    emoji_str = " ".join(reaction_emojis) if reaction_emojis else "(reaction removed)"
+
+    lines = [f"{emoji_str} Reaction from {label} ({sender_name}):"]
+    if original_content:
+        preview = original_content if len(original_content) <= 100 else original_content[:100] + "..."
+        lines.append(f"on message: \"{preview}\"")
+    else:
+        lines.append(f"on message_id {message_id} (original content not found - sent before this feature, or from another source)")
+
+    send_telegram_message(ADMIN_CHAT_ID, "\n".join(lines))
+    print(f"[REACTION RELAYED] from chat={chat_id} label={label} sender={sender_name} emoji={emoji_str}")
 
 
 def handle_command(text, chat_id, from_user_id, photo_file_id=None):
@@ -540,7 +613,6 @@ def handle_command(text, chat_id, from_user_id, photo_file_id=None):
     elif command == "/broadcast":
         if not is_admin(from_user_id):
             send_telegram_message(chat_id, "You're not authorized to use this command.")
-            print(f"[BROADCAST DENIED] user_id={from_user_id}")
             return
         if not BROADCAST_CHAT_IDS:
             send_telegram_message(chat_id, "No BROADCAST_CHAT_IDS configured.")
@@ -561,15 +633,14 @@ def handle_command(text, chat_id, from_user_id, photo_file_id=None):
     elif command == "/sendto":
         if not is_admin(from_user_id):
             send_telegram_message(chat_id, "You're not authorized to use this command.")
-            print(f"[SENDTO DENIED] user_id={from_user_id}")
             return
         if not rest:
-            send_telegram_message(chat_id, f"Usage: /sendto <LABEL> <message>\nOr attach an image with /sendto <LABEL> <caption> as the caption.\nKnown labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
+            send_telegram_message(chat_id, f"Usage: /sendto <LABEL> <message>\nKnown labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
             return
         label = rest[0]
         target_chat_id = resolve_label(label)
         if not target_chat_id:
-            send_telegram_message(chat_id, f"Unknown label '{label}'. Known labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
+            send_telegram_message(chat_id, f"Unknown label '{label}'.")
             return
         message_text = " ".join(rest[1:]) if len(rest) > 1 else None
         if photo_file_id:
@@ -585,10 +656,9 @@ def handle_command(text, chat_id, from_user_id, photo_file_id=None):
     elif command == "/addstockfor":
         if not is_admin(from_user_id):
             send_telegram_message(chat_id, "You're not authorized to use this command.")
-            print(f"[ADDSTOCKFOR DENIED] user_id={from_user_id}")
             return
         if len(rest) != 4:
-            send_telegram_message(chat_id, f"Usage: /addstockfor <LABEL> <SYMBOL> <PRICE> <above|below>\nKnown labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
+            send_telegram_message(chat_id, f"Usage: /addstockfor <LABEL> <SYMBOL> <PRICE> <above|below>")
             return
         label = rest[0]
         target_chat_id = resolve_label(label)
@@ -618,10 +688,9 @@ def handle_command(text, chat_id, from_user_id, photo_file_id=None):
     elif command == "/remindfor":
         if not is_admin(from_user_id):
             send_telegram_message(chat_id, "You're not authorized to use this command.")
-            print(f"[REMINDFOR DENIED] user_id={from_user_id}")
             return
         if len(rest) < 2:
-            send_telegram_message(chat_id, f"Usage: /remindfor <LABEL> [DATE] <TIME> [message]\nKnown labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
+            send_telegram_message(chat_id, f"Usage: /remindfor <LABEL> [DATE] <TIME> [message]")
             return
         label = rest[0]
         target_chat_id = resolve_label(label)
@@ -668,12 +737,11 @@ def handle_command(text, chat_id, from_user_id, photo_file_id=None):
             "Symbol format:\n"
             "NSE: TICKER.NS | BSE: TICKER.BO (ticker symbol, not numeric scrip code)\n\n"
             "Reminder commands (one-time):\n"
-            "/remindme [DATE] <TIME> [message] - DATE optional (today/tomorrow/DD-MM-YYYY)\n"
+            "/remindme [DATE] <TIME> [message]\n"
             "/removereminder [DATE] <TIME>\n"
             "/listreminders [DATE]\n\n"
             "Market hours: 9:00 AM-3:30 PM IST, Mon-Fri.\n"
-            "Your data here is independent from any other group.\n\n"
-            "Tip: reply directly to any message from this bot and your reply will reach the admin."
+            "Tip: reply to or react to any bot message and it reaches the admin."
         )
 
 
@@ -685,6 +753,19 @@ def poll_commands_loop():
         for update in updates:
             offset = update["update_id"] + 1
             save_offset(offset)
+
+            if "message_reaction" in update:
+                reaction = update["message_reaction"]
+                chat_id = reaction.get("chat", {}).get("id")
+                if str(chat_id) not in ALLOWED_CHAT_IDS:
+                    continue
+                message_id = reaction.get("message_id")
+                user = reaction.get("user", {})
+                new_reaction = reaction.get("new_reaction", [])
+                emojis = [r.get("emoji") for r in new_reaction if r.get("type") == "emoji" and r.get("emoji")]
+                relay_reaction_to_admin(chat_id, message_id, user, emojis)
+                continue
+
             message = update.get("message", {})
             text = message.get("text") or message.get("caption") or ""
             chat_id = message.get("chat", {}).get("id")
@@ -753,7 +834,7 @@ def main():
     print(f"Broadcast targets: {BROADCAST_CHAT_IDS}")
     print(f"Group labels: {GROUP_LABELS}")
     print(f"Admin user configured: {'yes' if ADMIN_TELEGRAM_USER_ID else 'NO'}")
-    print(f"Admin chat (reply relay target) configured: {'yes' if ADMIN_CHAT_ID else 'NO - reply relay disabled'}")
+    print(f"Admin chat (reply/reaction relay target): {'yes' if ADMIN_CHAT_ID else 'NO - relay disabled'}")
     threading.Thread(target=price_check_loop, daemon=True).start()
     threading.Thread(target=poll_commands_loop, daemon=True).start()
     threading.Thread(target=reminder_loop, daemon=True).start()
