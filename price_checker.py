@@ -16,6 +16,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_CHAT_IDS = [c.strip() for c in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if c.strip()]
 BROADCAST_CHAT_IDS = [c.strip() for c in os.getenv("BROADCAST_CHAT_IDS", "").split(",") if c.strip()]
 ADMIN_TELEGRAM_USER_ID = os.getenv("ADMIN_TELEGRAM_USER_ID", "").strip()
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()  # where relayed replies land (your own group)
 
 GROUP_LABELS = {}
 for pair in os.getenv("GROUP_LABELS", "").split(","):
@@ -259,6 +260,14 @@ def resolve_label(label):
     return GROUP_LABELS.get(label.strip().upper())
 
 
+def label_for_chat_id(chat_id):
+    chat_id_str = str(chat_id)
+    for label, cid in GROUP_LABELS.items():
+        if cid == chat_id_str:
+            return label
+    return chat_id_str
+
+
 def load_offset():
     with closing(get_conn()) as conn:
         with conn.cursor() as cur:
@@ -367,6 +376,20 @@ def is_valid_symbol(symbol):
 
 def is_admin(from_user_id):
     return bool(ADMIN_TELEGRAM_USER_ID) and str(from_user_id) == ADMIN_TELEGRAM_USER_ID
+
+
+def relay_reply_to_admin(chat_id, message):
+    if not ADMIN_CHAT_ID:
+        return
+    if str(chat_id) == ADMIN_CHAT_ID:
+        return  # don't relay replies happening in your own group back to yourself
+    sender = message.get("from", {})
+    sender_name = sender.get("first_name", "") or sender.get("username", "") or "Someone"
+    reply_text = message.get("text") or message.get("caption") or "(non-text message)"
+    label = label_for_chat_id(chat_id)
+    relayed = f"💬 Reply from {label} ({sender_name}):\n{reply_text}"
+    send_telegram_message(ADMIN_CHAT_ID, relayed)
+    print(f"[REPLY RELAYED] from chat={chat_id} label={label} sender={sender_name}")
 
 
 def handle_command(text, chat_id, from_user_id, photo_file_id=None):
@@ -649,7 +672,8 @@ def handle_command(text, chat_id, from_user_id, photo_file_id=None):
             "/removereminder [DATE] <TIME>\n"
             "/listreminders [DATE]\n\n"
             "Market hours: 9:00 AM-3:30 PM IST, Mon-Fri.\n"
-            "Your data here is independent from any other group."
+            "Your data here is independent from any other group.\n\n"
+            "Tip: reply directly to any message from this bot and your reply will reach the admin."
         )
 
 
@@ -667,6 +691,17 @@ def poll_commands_loop():
             from_user_id = message.get("from", {}).get("id")
             photo_list = message.get("photo")
             photo_file_id = photo_list[-1]["file_id"] if photo_list else None
+
+            if str(chat_id) not in ALLOWED_CHAT_IDS:
+                continue
+
+            reply_to = message.get("reply_to_message")
+            is_reply_to_bot = bool(reply_to and reply_to.get("from", {}).get("is_bot"))
+
+            if is_reply_to_bot and not text.startswith("/"):
+                relay_reply_to_admin(chat_id, message)
+                continue
+
             if text.startswith("/"):
                 handle_command(text, chat_id, from_user_id, photo_file_id)
         time.sleep(COMMAND_POLL_INTERVAL_SECONDS)
@@ -718,6 +753,7 @@ def main():
     print(f"Broadcast targets: {BROADCAST_CHAT_IDS}")
     print(f"Group labels: {GROUP_LABELS}")
     print(f"Admin user configured: {'yes' if ADMIN_TELEGRAM_USER_ID else 'NO'}")
+    print(f"Admin chat (reply relay target) configured: {'yes' if ADMIN_CHAT_ID else 'NO - reply relay disabled'}")
     threading.Thread(target=price_check_loop, daemon=True).start()
     threading.Thread(target=poll_commands_loop, daemon=True).start()
     threading.Thread(target=reminder_loop, daemon=True).start()
