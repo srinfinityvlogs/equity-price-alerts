@@ -17,6 +17,15 @@ ALLOWED_CHAT_IDS = [c.strip() for c in os.getenv("ALLOWED_CHAT_IDS", "").split("
 BROADCAST_CHAT_IDS = [c.strip() for c in os.getenv("BROADCAST_CHAT_IDS", "").split(",") if c.strip()]
 ADMIN_TELEGRAM_USER_ID = os.getenv("ADMIN_TELEGRAM_USER_ID", "").strip()
 
+# GROUP_LABELS format: "A:-5421732668,D:-5599739037,V:-5523392228"
+GROUP_LABELS = {}
+for pair in os.getenv("GROUP_LABELS", "").split(","):
+    pair = pair.strip()
+    if not pair or ":" not in pair:
+        continue
+    label, cid = pair.split(":", 1)
+    GROUP_LABELS[label.strip().upper()] = cid.strip()
+
 CHECK_INTERVAL_SECONDS = 180
 COMMAND_POLL_INTERVAL_SECONDS = 5
 REMINDER_CHECK_INTERVAL_SECONDS = 30
@@ -276,6 +285,10 @@ def format_date_for_display(date_str, now_ist):
     return date_str
 
 
+def resolve_label(label):
+    return GROUP_LABELS.get(label.strip().upper())
+
+
 # ---------- Offset (Postgres-backed) ----------
 
 def load_offset():
@@ -385,6 +398,10 @@ def is_valid_symbol(symbol):
         return False
 
 
+def is_admin(from_user_id):
+    return bool(ADMIN_TELEGRAM_USER_ID) and str(from_user_id) == ADMIN_TELEGRAM_USER_ID
+
+
 def handle_command(text, chat_id, from_user_id):
     chat_id_str = str(chat_id)
     if chat_id_str not in ALLOWED_CHAT_IDS:
@@ -402,7 +419,7 @@ def handle_command(text, chat_id, from_user_id):
 
     if command == "/addstock":
         if len(parts) != 4:
-            send_telegram_message(chat_id, "Usage: /addstock <SYMBOL> <TARGET_PRICE> <above|below>\nExample: /addstock RELIANCE.NS 3000 above")
+            send_telegram_message(chat_id, "Usage: /addstock <SYMBOL> <TARGET_PRICE> <above|below>")
             return
         symbol, price_str, condition = parts[1].upper(), parts[2], parts[3].lower()
         if condition not in ("above", "below"):
@@ -459,13 +476,7 @@ def handle_command(text, chat_id, from_user_id):
 
     elif command == "/remindme":
         if not rest:
-            send_telegram_message(
-                chat_id,
-                "Usage: /remindme [DATE] <TIME> [message]\n"
-                "DATE (optional): today, tomorrow, or DD-MM-YYYY (defaults to today)\n"
-                "TIME: 2PM, 2:30PM, 14:00, 09:15\n"
-                "Example: /remindme tomorrow 10AM Check IPO listing"
-            )
+            send_telegram_message(chat_id, "Usage: /remindme [DATE] <TIME> [message]")
             return
         maybe_date = parse_date_token(rest[0], now_ist)
         if maybe_date is not None:
@@ -482,14 +493,14 @@ def handle_command(text, chat_id, from_user_id):
         message_text = " ".join(message_tokens) if message_tokens else "⏰ Reminder: check the market!"
         parsed_time = parse_time_to_24h(time_str)
         if parsed_time is None:
-            send_telegram_message(chat_id, f"Couldn't understand time '{time_str}'. Try formats like 2PM, 2:30PM, or 14:00.")
+            send_telegram_message(chat_id, f"Couldn't understand time '{time_str}'.")
             return
         current_hm = now_ist.strftime("%H:%M")
         if target_date == today and parsed_time <= current_hm:
-            send_telegram_message(chat_id, f"'{parsed_time}' has already passed today ({current_hm} now). Choose a later time, or a future date.")
+            send_telegram_message(chat_id, f"'{parsed_time}' has already passed today. Choose a later time, or a future date.")
             return
         if target_date < today:
-            send_telegram_message(chat_id, f"'{target_date}' is in the past. Choose today or a future date.")
+            send_telegram_message(chat_id, f"'{target_date}' is in the past.")
             return
         add_reminder(chat_id, parsed_time, target_date, message_text)
         display_date = format_date_for_display(target_date, now_ist)
@@ -537,10 +548,9 @@ def handle_command(text, chat_id, from_user_id):
         send_telegram_message(chat_id, "\n".join(lines))
 
     elif command == "/broadcast":
-        # Admin-only, regardless of which allowed group it's sent from.
-        if not ADMIN_TELEGRAM_USER_ID or str(from_user_id) != ADMIN_TELEGRAM_USER_ID:
+        if not is_admin(from_user_id):
             send_telegram_message(chat_id, "You're not authorized to use this command.")
-            print(f"[BROADCAST DENIED] user_id={from_user_id} tried /broadcast")
+            print(f"[BROADCAST DENIED] user_id={from_user_id}")
             return
         if not rest:
             send_telegram_message(chat_id, "Usage: /broadcast <message>")
@@ -549,18 +559,109 @@ def handle_command(text, chat_id, from_user_id):
             send_telegram_message(chat_id, "No BROADCAST_CHAT_IDS configured.")
             return
         broadcast_text = " ".join(rest)
-        sent, failed = 0, []
+        sent = 0
         for target_chat_id in BROADCAST_CHAT_IDS:
-            try:
-                send_telegram_message(target_chat_id, broadcast_text)
-                sent += 1
-            except Exception as e:
-                failed.append(target_chat_id)
-        summary = f"✅ Broadcast sent to {sent} group(s)."
-        if failed:
-            summary += f" Failed: {failed}"
-        send_telegram_message(chat_id, summary)
+            send_telegram_message(target_chat_id, broadcast_text)
+            sent += 1
+        send_telegram_message(chat_id, f"✅ Broadcast sent to {sent} group(s).")
         print(f"[BROADCAST] Sent to {BROADCAST_CHAT_IDS} by user_id={from_user_id}")
+
+    elif command == "/sendto":
+        if not is_admin(from_user_id):
+            send_telegram_message(chat_id, "You're not authorized to use this command.")
+            print(f"[SENDTO DENIED] user_id={from_user_id}")
+            return
+        if len(rest) < 2:
+            send_telegram_message(chat_id, f"Usage: /sendto <LABEL> <message>\nKnown labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
+            return
+        label = rest[0]
+        target_chat_id = resolve_label(label)
+        if not target_chat_id:
+            send_telegram_message(chat_id, f"Unknown label '{label}'. Known labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
+            return
+        message_text = " ".join(rest[1:])
+        send_telegram_message(target_chat_id, message_text)
+        send_telegram_message(chat_id, f"✅ Sent to {label}.")
+        print(f"[SENDTO] label={label} chat_id={target_chat_id} by user_id={from_user_id}")
+
+    elif command == "/addstockfor":
+        if not is_admin(from_user_id):
+            send_telegram_message(chat_id, "You're not authorized to use this command.")
+            print(f"[ADDSTOCKFOR DENIED] user_id={from_user_id}")
+            return
+        if len(rest) != 4:
+            send_telegram_message(chat_id, f"Usage: /addstockfor <LABEL> <SYMBOL> <PRICE> <above|below>\nKnown labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
+            return
+        label = rest[0]
+        target_chat_id = resolve_label(label)
+        if not target_chat_id:
+            send_telegram_message(chat_id, f"Unknown label '{label}'. Known labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
+            return
+        symbol, price_str, condition = rest[1].upper(), rest[2], rest[3].lower()
+        if condition not in ("above", "below"):
+            send_telegram_message(chat_id, "Condition must be 'above' or 'below'.")
+            return
+        try:
+            target_price = float(price_str)
+        except ValueError:
+            send_telegram_message(chat_id, f"'{price_str}' is not a valid number.")
+            return
+        if not is_valid_symbol(symbol):
+            send_telegram_message(chat_id, f"Couldn't find price data for '{symbol}'.")
+            return
+        if stock_exists(target_chat_id, symbol, condition, target_price):
+            send_telegram_message(chat_id, f"'{symbol} {condition} ₹{target_price}' is already on {label}'s watchlist.")
+            return
+        display_name = symbol.replace(".NS", "").replace(".BO", "")
+        add_stock(target_chat_id, symbol, display_name, target_price, condition)
+        send_telegram_message(chat_id, f"✅ Added {symbol} to {label}'s watchlist: alert when price goes {condition} ₹{target_price}")
+        print(f"[ADDSTOCKFOR] label={label} chat_id={target_chat_id} {symbol} {condition} {target_price} by user_id={from_user_id}")
+
+    elif command == "/remindfor":
+        if not is_admin(from_user_id):
+            send_telegram_message(chat_id, "You're not authorized to use this command.")
+            print(f"[REMINDFOR DENIED] user_id={from_user_id}")
+            return
+        if len(rest) < 2:
+            send_telegram_message(chat_id, f"Usage: /remindfor <LABEL> [DATE] <TIME> [message]\nKnown labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
+            return
+        label = rest[0]
+        target_chat_id = resolve_label(label)
+        if not target_chat_id:
+            send_telegram_message(chat_id, f"Unknown label '{label}'. Known labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
+            return
+
+        remainder = rest[1:]
+        maybe_date = parse_date_token(remainder[0], now_ist)
+        if maybe_date is not None:
+            target_date = maybe_date
+            if len(remainder) < 2:
+                send_telegram_message(chat_id, "Missing time. Usage: /remindfor <LABEL> [DATE] <TIME> [message]")
+                return
+            time_str = remainder[1]
+            message_tokens = remainder[2:]
+        else:
+            target_date = today
+            time_str = remainder[0]
+            message_tokens = remainder[1:]
+
+        message_text = " ".join(message_tokens) if message_tokens else "⏰ Reminder: check the market!"
+        parsed_time = parse_time_to_24h(time_str)
+        if parsed_time is None:
+            send_telegram_message(chat_id, f"Couldn't understand time '{time_str}'.")
+            return
+        current_hm = now_ist.strftime("%H:%M")
+        if target_date == today and parsed_time <= current_hm:
+            send_telegram_message(chat_id, f"'{parsed_time}' has already passed today. Choose a later time, or a future date.")
+            return
+        if target_date < today:
+            send_telegram_message(chat_id, f"'{target_date}' is in the past.")
+            return
+
+        add_reminder(target_chat_id, parsed_time, target_date, message_text)
+        display_date = format_date_for_display(target_date, now_ist)
+        send_telegram_message(chat_id, f"✅ Reminder set for {label} at {parsed_time} IST on {display_date}: \"{message_text}\"")
+        print(f"[REMINDFOR] label={label} chat_id={target_chat_id} {parsed_time} {target_date} by user_id={from_user_id}")
 
     elif command == "/help":
         send_telegram_message(
@@ -570,9 +671,7 @@ def handle_command(text, chat_id, from_user_id):
             "/removestock <SYMBOL> [above|below] [PRICE]\n"
             "/liststocks\n\n"
             "Symbol format:\n"
-            "NSE: TICKER.NS (e.g. RELIANCE.NS)\n"
-            "BSE: TICKER.BO (e.g. AFCOM.BO) - use the trading symbol, "
-            "NOT the numeric BSE scrip code\n\n"
+            "NSE: TICKER.NS | BSE: TICKER.BO (ticker symbol, not numeric scrip code)\n\n"
             "Reminder commands (one-time):\n"
             "/remindme [DATE] <TIME> [message] - DATE optional (today/tomorrow/DD-MM-YYYY)\n"
             "/removereminder [DATE] <TIME>\n"
@@ -580,7 +679,7 @@ def handle_command(text, chat_id, from_user_id):
             "Market hours: 9:00 AM-3:30 PM IST, Mon-Fri.\n"
             "Your data here is independent from any other group."
         )
-        # Note: /broadcast intentionally NOT listed here - admin-only, undocumented in public help.
+        # /broadcast, /sendto, /addstockfor, /remindfor are admin-only and intentionally not listed here.
 
 
 def poll_commands_loop():
@@ -653,7 +752,8 @@ def main():
 
     print(f"Configured for {len(ALLOWED_CHAT_IDS)} chat(s): {ALLOWED_CHAT_IDS}")
     print(f"Broadcast targets: {BROADCAST_CHAT_IDS}")
-    print(f"Admin user configured: {'yes' if ADMIN_TELEGRAM_USER_ID else 'NO - /broadcast disabled'}")
+    print(f"Group labels: {GROUP_LABELS}")
+    print(f"Admin user configured: {'yes' if ADMIN_TELEGRAM_USER_ID else 'NO - admin commands disabled'}")
 
     threading.Thread(target=price_check_loop, daemon=True).start()
     threading.Thread(target=poll_commands_loop, daemon=True).start()
