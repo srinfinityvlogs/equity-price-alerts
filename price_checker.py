@@ -17,7 +17,6 @@ ALLOWED_CHAT_IDS = [c.strip() for c in os.getenv("ALLOWED_CHAT_IDS", "").split("
 BROADCAST_CHAT_IDS = [c.strip() for c in os.getenv("BROADCAST_CHAT_IDS", "").split(",") if c.strip()]
 ADMIN_TELEGRAM_USER_ID = os.getenv("ADMIN_TELEGRAM_USER_ID", "").strip()
 
-# GROUP_LABELS format: "A:-5421732668,D:-5599739037,V:-5523392228"
 GROUP_LABELS = {}
 for pair in os.getenv("GROUP_LABELS", "").split(","):
     pair = pair.strip()
@@ -35,8 +34,6 @@ MARKET_OPEN = dtime(9, 0)
 MARKET_CLOSE = dtime(15, 30)
 
 
-# ---------- Database setup ----------
-
 def get_conn():
     return psycopg2.connect(
         host=os.getenv("PGHOST"),
@@ -52,34 +49,26 @@ def init_db():
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS watchlist (
-                    chat_id TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    display_name TEXT,
-                    target_price DOUBLE PRECISION NOT NULL,
-                    condition TEXT NOT NULL,
+                    chat_id TEXT NOT NULL, symbol TEXT NOT NULL, display_name TEXT,
+                    target_price DOUBLE PRECISION NOT NULL, condition TEXT NOT NULL,
                     enabled BOOLEAN DEFAULT TRUE,
                     PRIMARY KEY (chat_id, symbol, condition, target_price)
                 )
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS alert_state (
-                    chat_id TEXT NOT NULL,
-                    alert_key TEXT NOT NULL,
-                    alerted_date TEXT NOT NULL,
+                    chat_id TEXT NOT NULL, alert_key TEXT NOT NULL, alerted_date TEXT NOT NULL,
                     PRIMARY KEY (chat_id, alert_key)
                 )
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bot_offset (
-                    id INTEGER PRIMARY KEY DEFAULT 1,
-                    offset_value BIGINT NOT NULL
+                    id INTEGER PRIMARY KEY DEFAULT 1, offset_value BIGINT NOT NULL
                 )
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS reminders (
-                    chat_id TEXT NOT NULL,
-                    remind_time TEXT NOT NULL,
-                    target_date TEXT NOT NULL,
+                    chat_id TEXT NOT NULL, remind_time TEXT NOT NULL, target_date TEXT NOT NULL,
                     message TEXT NOT NULL,
                     PRIMARY KEY (chat_id, remind_time, target_date)
                 )
@@ -87,8 +76,6 @@ def init_db():
         conn.commit()
     print("[DB] Tables ready.")
 
-
-# ---------- Watchlist (Postgres-backed) ----------
 
 def load_watchlist(chat_id):
     with closing(get_conn()) as conn:
@@ -99,10 +86,7 @@ def load_watchlist(chat_id):
                 (str(chat_id),)
             )
             rows = cur.fetchall()
-    return [
-        {"symbol": r[0], "display_name": r[1], "target_price": r[2], "condition": r[3], "enabled": r[4]}
-        for r in rows
-    ]
+    return [{"symbol": r[0], "display_name": r[1], "target_price": r[2], "condition": r[3], "enabled": r[4]} for r in rows]
 
 
 def stock_exists(chat_id, symbol, condition, target_price):
@@ -119,11 +103,9 @@ def add_stock(chat_id, symbol, display_name, target_price, condition):
     with closing(get_conn()) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                INSERT INTO watchlist (chat_id, symbol, display_name, target_price, condition, enabled)
+                """INSERT INTO watchlist (chat_id, symbol, display_name, target_price, condition, enabled)
                 VALUES (%s, %s, %s, %s, %s, TRUE)
-                ON CONFLICT (chat_id, symbol, condition, target_price) DO NOTHING
-                """,
+                ON CONFLICT (chat_id, symbol, condition, target_price) DO NOTHING""",
                 (str(chat_id), symbol, display_name, target_price, condition)
             )
         conn.commit()
@@ -146,8 +128,6 @@ def remove_stock(chat_id, symbol, condition_filter=None, price_filter=None):
     return removed_count
 
 
-# ---------- Alert state (Postgres-backed) ----------
-
 def is_already_alerted(chat_id, alert_key, today):
     with closing(get_conn()) as conn:
         with conn.cursor() as cur:
@@ -162,27 +142,19 @@ def mark_alerted(chat_id, alert_key, today):
     with closing(get_conn()) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                INSERT INTO alert_state (chat_id, alert_key, alerted_date)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (chat_id, alert_key) DO UPDATE SET alerted_date = EXCLUDED.alerted_date
-                """,
+                """INSERT INTO alert_state (chat_id, alert_key, alerted_date) VALUES (%s, %s, %s)
+                ON CONFLICT (chat_id, alert_key) DO UPDATE SET alerted_date = EXCLUDED.alerted_date""",
                 (str(chat_id), alert_key, today)
             )
         conn.commit()
 
 
-# ---------- Reminders (Postgres-backed, one-time, any date) ----------
-
 def add_reminder(chat_id, remind_time, target_date, message):
     with closing(get_conn()) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                INSERT INTO reminders (chat_id, remind_time, target_date, message)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (chat_id, remind_time, target_date) DO UPDATE SET message = EXCLUDED.message
-                """,
+                """INSERT INTO reminders (chat_id, remind_time, target_date, message) VALUES (%s, %s, %s, %s)
+                ON CONFLICT (chat_id, remind_time, target_date) DO UPDATE SET message = EXCLUDED.message""",
                 (str(chat_id), remind_time, target_date, message)
             )
         conn.commit()
@@ -205,14 +177,12 @@ def load_reminders(chat_id, target_date=None):
         with conn.cursor() as cur:
             if target_date:
                 cur.execute(
-                    "SELECT remind_time, target_date, message FROM reminders "
-                    "WHERE chat_id=%s AND target_date=%s ORDER BY remind_time",
+                    "SELECT remind_time, target_date, message FROM reminders WHERE chat_id=%s AND target_date=%s ORDER BY remind_time",
                     (str(chat_id), target_date)
                 )
             else:
                 cur.execute(
-                    "SELECT remind_time, target_date, message FROM reminders "
-                    "WHERE chat_id=%s ORDER BY target_date, remind_time",
+                    "SELECT remind_time, target_date, message FROM reminders WHERE chat_id=%s ORDER BY target_date, remind_time",
                     (str(chat_id),)
                 )
             return cur.fetchall()
@@ -289,8 +259,6 @@ def resolve_label(label):
     return GROUP_LABELS.get(label.strip().upper())
 
 
-# ---------- Offset (Postgres-backed) ----------
-
 def load_offset():
     with closing(get_conn()) as conn:
         with conn.cursor() as cur:
@@ -303,16 +271,12 @@ def save_offset(offset):
     with closing(get_conn()) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                INSERT INTO bot_offset (id, offset_value) VALUES (1, %s)
-                ON CONFLICT (id) DO UPDATE SET offset_value = EXCLUDED.offset_value
-                """,
+                """INSERT INTO bot_offset (id, offset_value) VALUES (1, %s)
+                ON CONFLICT (id) DO UPDATE SET offset_value = EXCLUDED.offset_value""",
                 (offset,)
             )
         conn.commit()
 
-
-# ---------- Market hours & price fetching ----------
 
 def is_market_open():
     now = datetime.now(IST)
@@ -343,6 +307,18 @@ def send_telegram_message(chat_id, message):
         print(f"[SEND ERROR] chat={chat_id}: {e}")
 
 
+def send_telegram_photo(chat_id, file_id, caption=None):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    data = {"chat_id": chat_id, "photo": file_id}
+    if caption:
+        data["caption"] = caption
+    try:
+        resp = requests.post(url, data=data, timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"[PHOTO SEND ERROR] chat={chat_id}: {e}")
+
+
 def check_watchlist_for_chat(chat_id):
     watchlist = load_watchlist(chat_id)
     today = get_today_key()
@@ -359,24 +335,15 @@ def check_watchlist_for_chat(chat_id):
             continue
         alert_key = f"{symbol}:{condition}:{target}"
         already_alerted = is_already_alerted(chat_id, alert_key, today)
-        triggered = (
-            (condition == "above" and price > target) or
-            (condition == "below" and price < target)
-        )
+        triggered = (condition == "above" and price > target) or (condition == "below" and price < target)
         print(f"chat={chat_id} {symbol}: Rs.{price:.2f} (target {condition} Rs.{target}) - triggered={triggered}, already_alerted={already_alerted}")
         if triggered and not already_alerted:
             direction = "risen above" if condition == "above" else "fallen below"
-            message = (
-                f"📈 Price Alert: {display_name}\n"
-                f"Current: ₹{price:.2f}\n"
-                f"Has {direction} your target of ₹{target}"
-            )
+            message = f"📈 Price Alert: {display_name}\nCurrent: ₹{price:.2f}\nHas {direction} your target of ₹{target}"
             send_telegram_message(chat_id, message)
             mark_alerted(chat_id, alert_key, today)
             print(f"[ALERTED] chat={chat_id} {symbol} ({condition} {target})")
 
-
-# ---------- Chat command handling ----------
 
 def get_updates(offset):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
@@ -402,7 +369,7 @@ def is_admin(from_user_id):
     return bool(ADMIN_TELEGRAM_USER_ID) and str(from_user_id) == ADMIN_TELEGRAM_USER_ID
 
 
-def handle_command(text, chat_id, from_user_id):
+def handle_command(text, chat_id, from_user_id, photo_file_id=None):
     chat_id_str = str(chat_id)
     if chat_id_str not in ALLOWED_CHAT_IDS:
         print(f"[IGNORED] Command from unauthorized chat_id={chat_id}")
@@ -482,7 +449,7 @@ def handle_command(text, chat_id, from_user_id):
         if maybe_date is not None:
             target_date = maybe_date
             if len(rest) < 2:
-                send_telegram_message(chat_id, "Missing time. Usage: /remindme [DATE] <TIME> [message]")
+                send_telegram_message(chat_id, "Missing time.")
                 return
             time_str = rest[1]
             message_tokens = rest[2:]
@@ -497,7 +464,7 @@ def handle_command(text, chat_id, from_user_id):
             return
         current_hm = now_ist.strftime("%H:%M")
         if target_date == today and parsed_time <= current_hm:
-            send_telegram_message(chat_id, f"'{parsed_time}' has already passed today. Choose a later time, or a future date.")
+            send_telegram_message(chat_id, f"'{parsed_time}' has already passed today.")
             return
         if target_date < today:
             send_telegram_message(chat_id, f"'{target_date}' is in the past.")
@@ -514,7 +481,7 @@ def handle_command(text, chat_id, from_user_id):
         if maybe_date is not None:
             target_date = maybe_date
             if len(rest) < 2:
-                send_telegram_message(chat_id, "Missing time. Usage: /removereminder [DATE] <TIME>")
+                send_telegram_message(chat_id, "Missing time.")
                 return
             time_str = rest[1]
         else:
@@ -552,35 +519,43 @@ def handle_command(text, chat_id, from_user_id):
             send_telegram_message(chat_id, "You're not authorized to use this command.")
             print(f"[BROADCAST DENIED] user_id={from_user_id}")
             return
-        if not rest:
-            send_telegram_message(chat_id, "Usage: /broadcast <message>")
-            return
         if not BROADCAST_CHAT_IDS:
             send_telegram_message(chat_id, "No BROADCAST_CHAT_IDS configured.")
             return
-        broadcast_text = " ".join(rest)
-        sent = 0
+        caption_or_text = " ".join(rest) if rest else None
+        if not photo_file_id and not caption_or_text:
+            send_telegram_message(chat_id, "Usage: /broadcast <message>\nOr attach an image with /broadcast <caption> as the caption.")
+            return
         for target_chat_id in BROADCAST_CHAT_IDS:
-            send_telegram_message(target_chat_id, broadcast_text)
-            sent += 1
-        send_telegram_message(chat_id, f"✅ Broadcast sent to {sent} group(s).")
-        print(f"[BROADCAST] Sent to {BROADCAST_CHAT_IDS} by user_id={from_user_id}")
+            if photo_file_id:
+                send_telegram_photo(target_chat_id, photo_file_id, caption_or_text)
+            else:
+                send_telegram_message(target_chat_id, caption_or_text)
+        kind = "image" if photo_file_id else "message"
+        send_telegram_message(chat_id, f"✅ Broadcast ({kind}) sent to {len(BROADCAST_CHAT_IDS)} group(s).")
+        print(f"[BROADCAST] kind={kind} to={BROADCAST_CHAT_IDS} by user_id={from_user_id}")
 
     elif command == "/sendto":
         if not is_admin(from_user_id):
             send_telegram_message(chat_id, "You're not authorized to use this command.")
             print(f"[SENDTO DENIED] user_id={from_user_id}")
             return
-        if len(rest) < 2:
-            send_telegram_message(chat_id, f"Usage: /sendto <LABEL> <message>\nKnown labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
+        if not rest:
+            send_telegram_message(chat_id, f"Usage: /sendto <LABEL> <message>\nOr attach an image with /sendto <LABEL> <caption> as the caption.\nKnown labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
             return
         label = rest[0]
         target_chat_id = resolve_label(label)
         if not target_chat_id:
             send_telegram_message(chat_id, f"Unknown label '{label}'. Known labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
             return
-        message_text = " ".join(rest[1:])
-        send_telegram_message(target_chat_id, message_text)
+        message_text = " ".join(rest[1:]) if len(rest) > 1 else None
+        if photo_file_id:
+            send_telegram_photo(target_chat_id, photo_file_id, message_text)
+        else:
+            if not message_text:
+                send_telegram_message(chat_id, "Provide a message, or attach an image with a caption.")
+                return
+            send_telegram_message(target_chat_id, message_text)
         send_telegram_message(chat_id, f"✅ Sent to {label}.")
         print(f"[SENDTO] label={label} chat_id={target_chat_id} by user_id={from_user_id}")
 
@@ -595,7 +570,7 @@ def handle_command(text, chat_id, from_user_id):
         label = rest[0]
         target_chat_id = resolve_label(label)
         if not target_chat_id:
-            send_telegram_message(chat_id, f"Unknown label '{label}'. Known labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
+            send_telegram_message(chat_id, f"Unknown label '{label}'.")
             return
         symbol, price_str, condition = rest[1].upper(), rest[2], rest[3].lower()
         if condition not in ("above", "below"):
@@ -628,15 +603,14 @@ def handle_command(text, chat_id, from_user_id):
         label = rest[0]
         target_chat_id = resolve_label(label)
         if not target_chat_id:
-            send_telegram_message(chat_id, f"Unknown label '{label}'. Known labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
+            send_telegram_message(chat_id, f"Unknown label '{label}'.")
             return
-
         remainder = rest[1:]
         maybe_date = parse_date_token(remainder[0], now_ist)
         if maybe_date is not None:
             target_date = maybe_date
             if len(remainder) < 2:
-                send_telegram_message(chat_id, "Missing time. Usage: /remindfor <LABEL> [DATE] <TIME> [message]")
+                send_telegram_message(chat_id, "Missing time.")
                 return
             time_str = remainder[1]
             message_tokens = remainder[2:]
@@ -644,7 +618,6 @@ def handle_command(text, chat_id, from_user_id):
             target_date = today
             time_str = remainder[0]
             message_tokens = remainder[1:]
-
         message_text = " ".join(message_tokens) if message_tokens else "⏰ Reminder: check the market!"
         parsed_time = parse_time_to_24h(time_str)
         if parsed_time is None:
@@ -652,12 +625,11 @@ def handle_command(text, chat_id, from_user_id):
             return
         current_hm = now_ist.strftime("%H:%M")
         if target_date == today and parsed_time <= current_hm:
-            send_telegram_message(chat_id, f"'{parsed_time}' has already passed today. Choose a later time, or a future date.")
+            send_telegram_message(chat_id, f"'{parsed_time}' has already passed today.")
             return
         if target_date < today:
             send_telegram_message(chat_id, f"'{target_date}' is in the past.")
             return
-
         add_reminder(target_chat_id, parsed_time, target_date, message_text)
         display_date = format_date_for_display(target_date, now_ist)
         send_telegram_message(chat_id, f"✅ Reminder set for {label} at {parsed_time} IST on {display_date}: \"{message_text}\"")
@@ -679,7 +651,6 @@ def handle_command(text, chat_id, from_user_id):
             "Market hours: 9:00 AM-3:30 PM IST, Mon-Fri.\n"
             "Your data here is independent from any other group."
         )
-        # /broadcast, /sendto, /addstockfor, /remindfor are admin-only and intentionally not listed here.
 
 
 def poll_commands_loop():
@@ -691,15 +662,15 @@ def poll_commands_loop():
             offset = update["update_id"] + 1
             save_offset(offset)
             message = update.get("message", {})
-            text = message.get("text", "")
+            text = message.get("text") or message.get("caption") or ""
             chat_id = message.get("chat", {}).get("id")
             from_user_id = message.get("from", {}).get("id")
+            photo_list = message.get("photo")
+            photo_file_id = photo_list[-1]["file_id"] if photo_list else None
             if text.startswith("/"):
-                handle_command(text, chat_id, from_user_id)
+                handle_command(text, chat_id, from_user_id, photo_file_id)
         time.sleep(COMMAND_POLL_INTERVAL_SECONDS)
 
-
-# ---------- Price checking loop ----------
 
 def price_check_loop():
     print("Starting price checker...")
@@ -717,8 +688,6 @@ def price_check_loop():
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 
-# ---------- Reminder loop ----------
-
 def reminder_loop():
     print("Starting reminder checker...")
     while True:
@@ -735,26 +704,20 @@ def reminder_loop():
         time.sleep(REMINDER_CHECK_INTERVAL_SECONDS)
 
 
-# ---------- Run all loops concurrently ----------
-
 def main():
     if not ALLOWED_CHAT_IDS:
-        print("[FATAL] No ALLOWED_CHAT_IDS configured. Set it in .env, comma-separated.")
+        print("[FATAL] No ALLOWED_CHAT_IDS configured.")
         return
-
     required = ["PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD"]
     missing = [v for v in required if not os.getenv(v)]
     if missing:
         print(f"[FATAL] Missing database env vars: {missing}")
         return
-
     init_db()
-
     print(f"Configured for {len(ALLOWED_CHAT_IDS)} chat(s): {ALLOWED_CHAT_IDS}")
     print(f"Broadcast targets: {BROADCAST_CHAT_IDS}")
     print(f"Group labels: {GROUP_LABELS}")
-    print(f"Admin user configured: {'yes' if ADMIN_TELEGRAM_USER_ID else 'NO - admin commands disabled'}")
-
+    print(f"Admin user configured: {'yes' if ADMIN_TELEGRAM_USER_ID else 'NO'}")
     threading.Thread(target=price_check_loop, daemon=True).start()
     threading.Thread(target=poll_commands_loop, daemon=True).start()
     threading.Thread(target=reminder_loop, daemon=True).start()
