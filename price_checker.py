@@ -18,13 +18,19 @@ BROADCAST_CHAT_IDS = [c.strip() for c in os.getenv("BROADCAST_CHAT_IDS", "").spl
 ADMIN_TELEGRAM_USER_ID = os.getenv("ADMIN_TELEGRAM_USER_ID", "").strip()
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
+# GROUP_LABELS format: "LABEL:chat_id" or "LABEL:chat_id:thread_id"
 GROUP_LABELS = {}
-for pair in os.getenv("GROUP_LABELS", "").split(","):
-    pair = pair.strip()
-    if not pair or ":" not in pair:
+for entry in os.getenv("GROUP_LABELS", "").split(","):
+    entry = entry.strip()
+    if not entry:
         continue
-    label, cid = pair.split(":", 1)
-    GROUP_LABELS[label.strip().upper()] = cid.strip()
+    bits = entry.split(":")
+    if len(bits) == 2:
+        label, cid = bits
+        GROUP_LABELS[label.strip().upper()] = (cid.strip(), None)
+    elif len(bits) == 3:
+        label, cid, thread_id = bits
+        GROUP_LABELS[label.strip().upper()] = (cid.strip(), int(thread_id.strip()))
 
 CHECK_INTERVAL_SECONDS = 180
 COMMAND_POLL_INTERVAL_SECONDS = 5
@@ -290,12 +296,13 @@ def format_date_for_display(date_str, now_ist):
 
 
 def resolve_label(label):
+    """Returns (chat_id, thread_id) tuple, or None if label unknown. thread_id may be None."""
     return GROUP_LABELS.get(label.strip().upper())
 
 
 def label_for_chat_id(chat_id):
     chat_id_str = str(chat_id)
-    for label, cid in GROUP_LABELS.items():
+    for label, (cid, _thread_id) in GROUP_LABELS.items():
         if cid == chat_id_str:
             return label
     return chat_id_str
@@ -340,10 +347,13 @@ def fetch_price(symbol):
     return float(data["Close"].iloc[-1])
 
 
-def send_telegram_message(chat_id, message, log_content=None):
+def send_telegram_message(chat_id, message, log_content=None, thread_id=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": chat_id, "text": message}
+    if thread_id:
+        data["message_thread_id"] = thread_id
     try:
-        resp = requests.post(url, data={"chat_id": chat_id, "text": message}, timeout=10)
+        resp = requests.post(url, data=data, timeout=10)
         resp.raise_for_status()
         result = resp.json().get("result", {})
         message_id = result.get("message_id")
@@ -354,11 +364,13 @@ def send_telegram_message(chat_id, message, log_content=None):
         return None
 
 
-def send_telegram_photo(chat_id, file_id, caption=None):
+def send_telegram_photo(chat_id, file_id, caption=None, thread_id=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     data = {"chat_id": chat_id, "photo": file_id}
     if caption:
         data["caption"] = caption
+    if thread_id:
+        data["message_thread_id"] = thread_id
     try:
         resp = requests.post(url, data=data, timeout=15)
         resp.raise_for_status()
@@ -459,7 +471,7 @@ def relay_reaction_to_admin(chat_id, message_id, user, reaction_emojis):
         preview = original_content if len(original_content) <= 100 else original_content[:100] + "..."
         lines.append(f"on message: \"{preview}\"")
     else:
-        lines.append(f"on message_id {message_id} (original content not found - sent before this feature, or from another source)")
+        lines.append(f"on message_id {message_id} (original content not found)")
 
     send_telegram_message(ADMIN_CHAT_ID, "\n".join(lines))
     print(f"[REACTION RELAYED] from chat={chat_id} label={label} sender={sender_name} emoji={emoji_str}")
@@ -638,20 +650,21 @@ def handle_command(text, chat_id, from_user_id, photo_file_id=None):
             send_telegram_message(chat_id, f"Usage: /sendto <LABEL> <message>\nKnown labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
             return
         label = rest[0]
-        target_chat_id = resolve_label(label)
-        if not target_chat_id:
-            send_telegram_message(chat_id, f"Unknown label '{label}'.")
+        target = resolve_label(label)
+        if not target:
+            send_telegram_message(chat_id, f"Unknown label '{label}'. Known labels: {', '.join(GROUP_LABELS.keys()) or 'none configured'}")
             return
+        target_chat_id, thread_id = target
         message_text = " ".join(rest[1:]) if len(rest) > 1 else None
         if photo_file_id:
-            send_telegram_photo(target_chat_id, photo_file_id, message_text)
+            send_telegram_photo(target_chat_id, photo_file_id, message_text, thread_id=thread_id)
         else:
             if not message_text:
                 send_telegram_message(chat_id, "Provide a message, or attach an image with a caption.")
                 return
-            send_telegram_message(target_chat_id, message_text)
+            send_telegram_message(target_chat_id, message_text, thread_id=thread_id)
         send_telegram_message(chat_id, f"✅ Sent to {label}.")
-        print(f"[SENDTO] label={label} chat_id={target_chat_id} by user_id={from_user_id}")
+        print(f"[SENDTO] label={label} chat_id={target_chat_id} thread={thread_id} by user_id={from_user_id}")
 
     elif command == "/addstockfor":
         if not is_admin(from_user_id):
@@ -661,10 +674,11 @@ def handle_command(text, chat_id, from_user_id, photo_file_id=None):
             send_telegram_message(chat_id, f"Usage: /addstockfor <LABEL> <SYMBOL> <PRICE> <above|below>")
             return
         label = rest[0]
-        target_chat_id = resolve_label(label)
-        if not target_chat_id:
+        target = resolve_label(label)
+        if not target:
             send_telegram_message(chat_id, f"Unknown label '{label}'.")
             return
+        target_chat_id, _thread_id = target
         symbol, price_str, condition = rest[1].upper(), rest[2], rest[3].lower()
         if condition not in ("above", "below"):
             send_telegram_message(chat_id, "Condition must be 'above' or 'below'.")
@@ -693,10 +707,11 @@ def handle_command(text, chat_id, from_user_id, photo_file_id=None):
             send_telegram_message(chat_id, f"Usage: /remindfor <LABEL> [DATE] <TIME> [message]")
             return
         label = rest[0]
-        target_chat_id = resolve_label(label)
-        if not target_chat_id:
+        target = resolve_label(label)
+        if not target:
             send_telegram_message(chat_id, f"Unknown label '{label}'.")
             return
+        target_chat_id, _thread_id = target
         remainder = rest[1:]
         maybe_date = parse_date_token(remainder[0], now_ist)
         if maybe_date is not None:
